@@ -55,8 +55,50 @@ else
 fi
 
 if [[ ${#DEVICES[@]} -eq 0 ]]; then
-  echo "No NVMe controllers found." >&2
-  exit 1
+  hdr "No /dev/nvme* controllers found — checking PCI bus"
+
+  PCI_NVME=""
+  if command -v lspci >/dev/null 2>&1; then
+    # Class 0108xx = Non-Volatile memory controller (covers 010802 NVMe and friends).
+    PCI_NVME=$(lspci -nn -d ::0108 2>/dev/null)
+  else
+    note "lspci not available; cannot cross-check the PCI bus."
+  fi
+
+  if [[ -n "$PCI_NVME" ]]; then
+    fail "NVMe controller visible on PCI bus but NOT enumerated as /dev/nvme* — driver is not bound to it."
+    echo "$PCI_NVME"
+    note "This usually means the controller dropped off (crashed/reset) and the kernel gave up on it,"
+    note "or it never bound to the nvme driver in the first place. Details below."
+
+    PCI_SLOT=$(echo "$PCI_NVME" | awk '{print $1; exit}')
+    if [[ -n "$PCI_SLOT" ]] && command -v lspci >/dev/null 2>&1; then
+      hdr "lspci -vvv for $PCI_SLOT (driver binding, AER status)"
+      lspci -vvvs "$PCI_SLOT" 2>&1
+    fi
+
+    if command -v dmesg >/dev/null 2>&1; then
+      hdr "Recent dmesg mentions of nvme/PCIe errors"
+      DMESG_HITS=$(dmesg -T 2>/dev/null | grep -iE 'nvme|pcie.*(aer|error)|link.*(down|degraded)' | tail -50)
+      if [[ -n "$DMESG_HITS" ]]; then
+        echo "$DMESG_HITS"
+        echo "$DMESG_HITS" | grep -qiE 'cfs|fatal'      && fail "dmesg shows CFS/fatal controller error events."
+        echo "$DMESG_HITS" | grep -qiE 'removed|surprise' && fail "dmesg shows the device being removed/surprise-removed."
+        echo "$DMESG_HITS" | grep -qiE 'timeout|reset'   && fail "dmesg shows NVMe command timeouts/resets — consistent with a dying controller."
+      else
+        note "No matching lines in current dmesg buffer (note: buffer may have rotated — try journalctl -k)."
+      fi
+    else
+      note "dmesg not available."
+    fi
+
+    hdr "Summary"
+    printf '%s%d failure(s), %d warning(s) — controller is present on PCIe but has fallen off the nvme driver; treat as failed/failing.%s\n' "$RED" "$FAILURES" "$WARNINGS" "$RST"
+    exit 2
+  else
+    echo "No NVMe controllers found on the PCI bus either — no NVMe hardware detected." >&2
+    exit 1
+  fi
 fi
 
 echo "NVMe controllers to check: ${DEVICES[*]}"
