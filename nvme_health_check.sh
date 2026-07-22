@@ -60,7 +60,8 @@ if [[ ${#DEVICES[@]} -eq 0 ]]; then
   PCI_NVME=""
   if command -v lspci >/dev/null 2>&1; then
     # Class 0108xx = Non-Volatile memory controller (covers 010802 NVMe and friends).
-    PCI_NVME=$(lspci -nn -d ::0108 2>/dev/null)
+    # -D forces the domain prefix so the slot id doubles as the /sys/bus/pci/devices/<BDF> name.
+    PCI_NVME=$(lspci -D -nn -d ::0108 2>/dev/null)
   else
     note "lspci not available; cannot cross-check the PCI bus."
   fi
@@ -71,10 +72,58 @@ if [[ ${#DEVICES[@]} -eq 0 ]]; then
     note "This usually means the controller dropped off (crashed/reset) and the kernel gave up on it,"
     note "or it never bound to the nvme driver in the first place. Details below."
 
-    PCI_SLOT=$(echo "$PCI_NVME" | awk '{print $1; exit}')
-    if [[ -n "$PCI_SLOT" ]] && command -v lspci >/dev/null 2>&1; then
-      hdr "lspci -vvv for $PCI_SLOT (driver binding, AER status)"
-      lspci -vvvs "$PCI_SLOT" 2>&1
+    PCI_BDF=$(echo "$PCI_NVME" | awk '{print $1; exit}')
+    if [[ -n "$PCI_BDF" ]] && command -v lspci >/dev/null 2>&1; then
+      hdr "lspci -vvv for $PCI_BDF (driver binding, AER status)"
+      lspci -vvvs "$PCI_BDF" 2>&1
+    fi
+
+    # --- Raw CSTS register peek: with no /dev/nvme node, nvme-cli's ioctl path is
+    # unavailable, but the PCI BAR is still reachable via sysfs even unbound from
+    # any driver. CSTS lives at MMIO offset 0x1C (CAP at 0x0) per the NVMe spec —
+    # read it directly to check CFS (bit1) even though the controller "vanished".
+    hdr "$PCI_BDF — raw CSTS register peek via PCI BAR0 (bypassing driver)"
+    if [[ -n "$PCI_BDF" ]] && command -v python3 >/dev/null 2>&1; then
+      RESOURCE0="/sys/bus/pci/devices/$PCI_BDF/resource0"
+      if [[ -r "$RESOURCE0" ]]; then
+        REGDUMP=$(timeout 5 python3 - "$RESOURCE0" <<'PYEOF'
+import struct, sys
+path = sys.argv[1]
+try:
+    with open(path, "rb", buffering=0) as f:
+        f.seek(0)
+        cap = f.read(8)
+        f.seek(0x1c)
+        csts = f.read(4)
+    print("CAP=%#018x" % struct.unpack("<Q", cap)[0])
+    print("CSTS=%#010x" % struct.unpack("<I", csts)[0])
+except Exception as e:
+    print("ERROR=%s" % e)
+PYEOF
+)
+        echo "$REGDUMP"
+        if echo "$REGDUMP" | grep -q '^ERROR='; then
+          warn "Could not read BAR0 directly ($(echo "$REGDUMP" | sed -n 's/^ERROR=//p')) — may need CAP_SYS_RAWIO, or the BAR isn't currently mapped."
+        else
+          CAP_HEX=$(echo "$REGDUMP" | sed -n 's/^CAP=//p')
+          CSTS_HEX=$(echo "$REGDUMP" | sed -n 's/^CSTS=//p')
+          if [[ "$CAP_HEX" == "0xffffffffffffffff" ]]; then
+            fail "BAR0 reads all 1s (CAP=$CAP_HEX) — PCIe MMIO is unresponsive. The controller is dead/hung on the bus, not just unbound from the driver."
+          else
+            CSTS_DEC=$((CSTS_HEX))
+            if [[ $((CSTS_DEC & 0x02)) -ne 0 ]]; then
+              fail "$PCI_BDF CSTS.CFS (bit1) is SET, read directly off hardware ($CSTS_HEX) — Controller Fatal Status, confirmed even with no driver bound."
+            else
+              ok "CSTS.CFS bit not set ($CSTS_HEX) — register is readable and not reporting fatal status; the drop is likely link/AER related, check dmesg below."
+            fi
+            [[ $((CSTS_DEC & 0x01)) -eq 0 ]] && warn "$PCI_BDF CSTS.RDY (bit0) is 0 — controller is not in the ready state."
+          fi
+        fi
+      else
+        note "Cannot read $RESOURCE0 (needs root, or BAR0 isn't memory-mapped) — skipping raw register peek."
+      fi
+    else
+      note "python3 not available — skipping raw CSTS register peek."
     fi
 
     if command -v dmesg >/dev/null 2>&1; then
