@@ -147,7 +147,7 @@ for dev in "${DEVICES[@]}"; do
   UNSAFE_SHUT=$(echo "$SMART" | awk -F: '/unsafe_shutdowns/ {gsub(/[^0-9]/,"",$2); print $2; exit}')
   [[ -n "${UNSAFE_SHUT:-}" ]] && note "unsafe_shutdowns = $UNSAFE_SHUT"
 
-  TEMP=$(echo "$SMART" | awk -F: '/^temperature/ {print $2; exit}' | grep -oE '[0-9]+')
+  TEMP=$(echo "$SMART" | awk -F: '/^temperature/ {print $2; exit}' | grep -oE '[0-9]+' | head -1)
   if [[ -n "${TEMP:-}" ]]; then
     if [[ $TEMP -ge 85 ]]; then
       fail "temperature ${TEMP}C — very high"
